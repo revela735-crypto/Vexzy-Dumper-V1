@@ -1,0 +1,218 @@
+require('dotenv').config();
+const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
+});
+
+const PREFIX = '.l';
+
+// ================= RUNTIME HOOK =================
+function runLuaLikeSandbox(code) {
+    let captured = [];
+
+    const sandbox = {
+        loadstring: (str) => {
+            captured.push(str);
+            return () => str;
+        },
+        load: (str) => {
+            captured.push(str);
+            return () => str;
+        },
+        print: (...args) => {
+            captured.push(args.join(' '));
+        },
+        string: {
+            char: (...codes) => String.fromCharCode(...codes),
+        },
+        table: {
+            concat: (arr, sep = '') => arr.join(sep),
+        }
+    };
+
+    try {
+        vm.createContext(sandbox);
+        vm.runInContext(code, sandbox, { timeout: 2000 });
+    } catch {}
+
+    return captured.join('\n') || code;
+}
+
+// ================= WEAREDEVS =================
+function deobfuscateWeAreDevs(code) {
+    try {
+        let result = code;
+
+        result = result.replace(/\\(\d{3})/g, (_, d) =>
+            String.fromCharCode(parseInt(d, 8))
+        );
+
+        result = result.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) =>
+            String.fromCharCode(parseInt(h, 16))
+        );
+
+        const match = result.match(/loadstring\s*\(\s*decode\s*\(\s*["']([^"']+)["']\s*\)\s*\)/);
+
+        if (match) {
+            return Buffer.from(match[1], 'base64').toString();
+        }
+
+        return result;
+    } catch {
+        return code;
+    }
+}
+
+// ================= MOONSEC V3 =================
+function deobfuscateMoonsec(code) {
+    try {
+        if (!code.includes('local V={')) return code;
+
+        let result = code;
+
+        const tableMatch = code.match(/local\s+V\s*=\s*\{([\s\S]*?)\}/);
+        if (!tableMatch) return code;
+
+        const raw = tableMatch[1];
+
+        const strings = [];
+        const regex = /["']([^"']*)["']/g;
+        let m;
+
+        while ((m = regex.exec(raw)) !== null) {
+            strings.push(m[1]);
+        }
+
+        result = result.replace(/V\[(\d+)\]/g, (_, i) =>
+            strings[i] !== undefined ? `"${strings[i]}"` : _
+        );
+
+        result = result.replace(/_\[(\d+)\]/g, (_, i) =>
+            strings[i] !== undefined ? `"${strings[i]}"` : _
+        );
+
+        result = result.replace(/local\s+V\s*=\s*\{[\s\S]*?\}\s*/, '');
+
+        return result;
+    } catch {
+        return code;
+    }
+}
+
+// ================= PIPELINE =================
+async function deobfPipeline(code) {
+    let prev;
+
+    for (let i = 0; i < 5; i++) {
+        prev = code;
+
+        code = deobfuscateWeAreDevs(code);
+        code = deobfuscateMoonsec(code);
+
+        const runtime = runLuaLikeSandbox(code);
+        if (runtime && runtime !== code) {
+            code = runtime;
+        }
+
+        code = code.replace(/[\x00-\x1F]/g, '');
+
+        if (code === prev) break;
+    }
+
+    return code;
+}
+
+// ================= FETCH =================
+async function fetchFromURL(url) {
+    const res = await axios.get(url, { responseType: 'text', timeout: 15000 });
+    return res.data;
+}
+
+// ================= BOT READY =================
+client.once('ready', () => {
+    console.log(`✅ Bot ready sebagai ${client.user.tag}`);
+});
+
+// ================= COMMAND =================
+client.on('messageCreate', async (message) => {
+    if (message.author.bot) return;
+    if (!message.content.startsWith(PREFIX)) return;
+
+    const args = message.content.slice(PREFIX.length).trim().split(/ +/);
+
+    let code = null;
+    let source = '';
+
+    const attachment = message.attachments.first();
+
+    // FILE
+    if (attachment) {
+        const ext = path.extname(attachment.name).toLowerCase();
+        if (!['.lua', '.txt', '.luau'].includes(ext)) {
+            return message.reply('❌ File tidak didukung.');
+        }
+
+        source = `📎 ${attachment.name}`;
+        const res = await axios.get(attachment.url);
+        code = res.data;
+    }
+
+    // URL / TEXT
+    if (!code && args.length > 0) {
+        if (args[0].startsWith('http')) {
+            source = '🔗 URL';
+            try {
+                code = await fetchFromURL(args[0]);
+            } catch {
+                return message.reply('❌ Gagal fetch URL');
+            }
+        } else {
+            source = '📝 Direct';
+            code = args.join(' ');
+        }
+    }
+
+    if (!code) {
+        return message.reply(`❌ Usage: \`${PREFIX} <file/url/code>\``);
+    }
+
+    await message.channel.sendTyping();
+
+    try {
+        const start = Date.now();
+        const result = await deobfPipeline(code);
+        const time = Date.now() - start;
+
+        const embed = new EmbedBuilder()
+            .setTitle('📄 Deobf Result')
+            .setColor(0x00ff00)
+            .addFields(
+                { name: 'Source', value: source },
+                { name: 'Time', value: `${time}ms`, inline: true }
+            );
+
+        if (result.length > 1900) {
+            const fileName = `deobf_${Date.now()}.lua`;
+            fs.writeFileSync(fileName, result);
+            await message.reply({ embeds: [embed], files: [fileName] });
+            fs.unlinkSync(fileName);
+        } else {
+            embed.setDescription(`\`\`\`lua\n${result.substring(0, 3800)}\n\`\`\``);
+            await message.reply({ embeds: [embed] });
+        }
+
+    } catch (err) {
+        message.reply(`❌ Error: ${err.message}`);
+    }
+});
+
+      client.login(process.env.DISCORD_TOKEN);
