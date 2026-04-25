@@ -1,0 +1,16 @@
+{
+  "name": "vexzy-dumper",
+  "version": "1.0.0",
+  "description": "Vexzy Dumper - Full Deobfuscator Bot for Roblox Lua",
+  "main": "vexzy.js",
+  "scripts": {
+    "start": "node vexzy.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1"
+  },
+  "author": "Vexzy",
+  "license": "MIT"
+}
